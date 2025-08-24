@@ -21,13 +21,14 @@ Lightweight Network Probe for Multi-Node Active Monitoring
 ### 快速部署
 #### 安装
 ```sh
-curl -sSfL https://raw.githubusercontent.com/ProxyPanel/PingAgent/main/scripts/ping-agent.sh \
-     | bash -s -- install \
-       --token 123456 \
-       --listen ":8080" \
-       --allow-ips "127.0.0.1,10.0.0.0/8" \
-       --allow-domains "control.example.com" \
-       --version latest
+curl -sSfL https://raw.githubusercontent.com/ProxyPanel/PingAgent/main/ping-agent.sh | \
+bash -s -- install \
+  --token 123456 \
+  --listen ":8080" \
+  --allow-ips "127.0.0.1,10.0.0.0/8" \
+  --allow-domains "control.example.com" \
+  --version latest
+
 ```
 
 
