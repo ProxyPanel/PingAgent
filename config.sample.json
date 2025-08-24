@@ -1,0 +1,6 @@
+{
+  "http_listen": ":50051",
+  "auth": {
+    "token": "ChangeMeIfNeeded"
+  }
+}

@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Install UPX
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install upx-ucl
+          upx --version
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v5
+        with:
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compress binaries with UPX
+        run: |
+          echo "开始压缩二进制文件..."
+
+          # 查找所有二进制文件（不是归档文件）
+          find dist/ -type f -executable -not -name "*.tar.gz" -not -name "*.zip" -not -name "*.txt" | while read -r file; do
+            echo "处理文件: $file"
+            
+            # 获取文件信息
+            file_info=$(file "$file")
+            file_size_before=$(stat -c%s "$file")
+            
+            # 检查是否为可执行文件
+            if echo "$file_info" | grep -q "executable"; then
+              # 尝试压缩
+              if upx --lzma --best "$file" 2>/dev/null; then
+                file_size_after=$(stat -c%s "$file")
+                compression_ratio=$(echo "scale=1; ($file_size_before - $file_size_after) * 100 / $file_size_before" | bc)
+                echo "✅ 成功压缩 $file (压缩率: ${compression_ratio}%)"
+              else
+                echo "⚠️  跳过 $file (UPX 不支持或压缩失败)"
+              fi
+            else
+              echo "⚠️  跳过 $file (非可执行文件)"
+            fi
+          done
+
+          echo "UPX 压缩完成！"
+
+      - name: List final artifacts
+        run: |
+          echo "最终构建产物："
+          find dist/ -type f -name "*" | sort

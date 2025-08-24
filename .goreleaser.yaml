@@ -1,0 +1,47 @@
+project_name: ping-agent
+
+builds:
+  - id: default
+    main: ./cmd/agent
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64, 386]
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -buildid=
+      - -X "main.Version={{ .Tag }}"
+    ignore:
+      - goos: darwin
+        goarch: 386
+
+archives:
+  - id: default
+    format_overrides:
+      - goos: windows
+        format: zip
+      - goos: linux
+        format: tar.gz
+      - goos: darwin
+        format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Tag }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "{{ .ProjectName }}_checksums.txt"
+
+release:
+  github:
+    owner: ProxyPanel
+    name: PingAgent
+  # 添加发布说明
+  header: |
+    ## 🚀 新版本发布
+
+    感谢使用 ping-agent！
+
+  footer: |
+    ## 📦 安装说明
+
+    下载对应平台的二进制文件即可使用。所有二进制文件已使用 UPX 压缩以减小体积。
