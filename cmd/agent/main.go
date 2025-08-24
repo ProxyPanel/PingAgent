@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -16,6 +17,9 @@ import (
 
 	probing "github.com/prometheus-community/pro-bing"
 )
+
+// 版本信息，由构建时注入
+var Version = "dev"
 
 /* ------------ 配置 ------------ */
 type Config struct {
@@ -29,241 +33,491 @@ type Config struct {
 
 /* ---------- 白名单缓存 ---------- */
 type domainCache struct {
-	IPs        []net.IP
+	IPs        []string
 	LastUpdate time.Time
 }
 
-/* ------------ 全局 ------------ */
+/* ------------ 全局变量 ------------ */
 var (
 	conf         Config
 	ipNetworks   []*net.IPNet
-	soloIPs      map[string]struct{}
-	domainCaches = map[string]*domainCache{}
-	mu           sync.RWMutex
+	soloIPs      sync.Map 
+	domainCaches = sync.Map{}
 	allowAll     bool
-
-	dialer = net.Dialer{Timeout: timeout}
+	dnsCache     = sync.Map{}
 )
 
 /* ------------ 常量 ------------ */
 const (
-	timeout   = 10 * time.Second
-	pingCount = 3
-	domainTTL = 5 * time.Minute
+	// 探测参数 - 关键优化点
+	icmpCount   = 3                       // ICMP ping 次数
+	tcpCount    = 3                       // TCP 连接次数
+	probeTimeout = 1500 * time.Millisecond // 单次探测超时
+	totalTimeout = 5 * time.Second         // 总超时时间
+	
+	// 缓存和后台任务
+	dnsCacheTTL = 2 * time.Minute
+	domainTTL   = 5 * time.Minute
+	
+	// 并发控制
+	maxConcurrentProbes = 50 // 降低并发数，避免资源竞争
 )
+
+/* ---------- DNS 缓存结构 ---------- */
+type dnsEntry struct {
+	IP       string
+	Expiry   time.Time
+	Resolved bool
+}
 
 /* =============== 主函数 =============== */
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("用法: ./ping-agent <config.json>")
-		os.Exit(1)
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		fmt.Printf("ping-agent %s\n", Version)
+		return
 	}
+
+	if len(os.Args) < 2 {
+		log.Fatal("Usage: ./ping-agent <config.json> Or ./ping-agent --version")
+	}
+
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	
 	loadConfig(os.Args[1])
 	buildWhiteList()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	
+	go domainRefreshWorker(ctx)
+	go dnsCacheCleanup(ctx)
+
+	probeSemaphore := make(chan struct{}, maxConcurrentProbes)
+	
 	mux := http.NewServeMux()
-	mux.HandleFunc("/probe", httpHandler)
+	mux.HandleFunc("/probe", func(w http.ResponseWriter, r *http.Request) {
+		probeHandler(w, r, probeSemaphore)
+	})
 
 	srv := &http.Server{
-		Addr:         conf.HttpListen,
-		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 5 * time.Second,
-		IdleTimeout:  30 * time.Second,
+		Addr:              conf.HttpListen,
+		Handler:           mux,
+		ReadTimeout:       3 * time.Second,
+		WriteTimeout:      5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 1 * time.Second,
+		MaxHeaderBytes:    8192,
 	}
 
-	log.Printf("PingAgent HTTP 监听 %s", conf.HttpListen)
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("listen: %v", err)
-	}
+	go func() {
+		log.Printf("PingAgent Start! Listen %s", conf.HttpListen)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP Service failed: %v", err)
+		}
+	}()
 
-	// 2. 等待 Ctrl-C / kill
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("收到退出信号, 正在关闭 HTTP 服务器...")
-
-	// 3. 优雅关闭（给 5 秒处理正在运行的请求）
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatalf("HTTP 服务器关闭出错: %v", err)
+	
+	log.Println("Closing Service...")
+	
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Close failed: %v", err)
 	}
-	log.Println("HTTP 服务器已关闭, 程序退出")
 }
 
-/* =============== HTTP =============== */
+/* =============== HTTP 处理器 =============== */
 type httpReq struct {
 	Target string `json:"target"`
-	Port   int    `json:"port,omitempty"` // 可省略
+	Port   int    `json:"port,omitempty"`
 }
+
 type httpResp struct {
 	IP   string  `json:"ip"`
 	ICMP float64 `json:"icmp"`
 	TCP  float64 `json:"tcp"`
 }
 
-func httpHandler(w http.ResponseWriter, r *http.Request) {
+func probeHandler(w http.ResponseWriter, r *http.Request, semaphore chan struct{}) {
 	if r.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, "POST only")
+		writeJSONError(w, http.StatusMethodNotAllowed, "Only Support POST Method")
 		return
 	}
 
-	if !ipAllowed(realIP(r)) {
-		writeJSONError(w, http.StatusForbidden, "forbidden ip")
+	if !ipAllowed(extractClientIP(r)) {
+		writeJSONError(w, http.StatusForbidden, "IP Not Allowed")
 		return
 	}
-	if conf.Auth.Token != "" {
-		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if got != conf.Auth.Token {
-			writeJSONError(w, http.StatusUnauthorized, "unauthorized token")
-			return
-		}
+	if conf.Auth.Token != "" && extractBearerToken(r.Header.Get("Authorization")) != conf.Auth.Token {
+		writeJSONError(w, http.StatusUnauthorized, "Authorization Token Invalid")
+		return
+	}
+
+	// 并发控制
+	select {
+	case semaphore <- struct{}{}:
+		defer func() { <-semaphore }()
+	default:
+		writeJSONError(w, http.StatusTooManyRequests, "Too Many Requests")
+		return
 	}
 
 	var req httpReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "bad json")
+		writeJSONError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 
 	if req.Target == "" {
-		writeJSONError(w, http.StatusBadRequest, "invalid param")
-		return
-	}
-	if req.Port < 0 || req.Port > 65535 {
-		writeJSONError(w, http.StatusBadRequest, "invalid port")
+		writeJSONError(w, http.StatusBadRequest, "Missing Target Parameter")
 		return
 	}
 
-	ip, err := resolveTarget(req.Target)
+	if req.Port <= 0 {
+		req.Port = 22
+	} else if req.Port > 65535 {
+		writeJSONError(w, http.StatusBadRequest, "Invalid Port")
+		return
+	}
+
+	// DNS 解析
+	ip, err := resolveWithCache(req.Target)
 	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "dns fail")
+		writeJSONError(w, http.StatusBadRequest, "DNS Resolve Failed")
 		return
 	}
 
-	icmpRTT := probeICMP(ip)
-	tcpRTT := probeTCP(ip, func() int {
-		if req.Port > 0 {
-			return req.Port
-		}
-		return 22
-	}())
+	// 使用 context 控制整体探测超时
+	ctxProbe, cancel := context.WithTimeout(r.Context(), totalTimeout)
+	defer cancel()
 
-	_ = json.NewEncoder(w).Encode(httpResp{IP: ip, ICMP: icmpRTT, TCP: tcpRTT})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var icmpRTT, tcpRTT float64
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if v := probeICMPConcurrent(ctxProbe, ip); v > 0 {
+			mu.Lock()
+			icmpRTT = v
+			mu.Unlock()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if v := probeTCPConcurrent(ctxProbe, ip, req.Port); v > 0 {
+			mu.Lock()
+			tcpRTT = v
+			mu.Unlock()
+		}
+	}()
+
+	wg.Wait()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(httpResp{IP: ip, ICMP: icmpRTT, TCP: tcpRTT})
 }
 
-/* =============== 探测 =============== */
-func probeICMP(host string) float64 {
-	p, err := probing.NewPinger(host)
-	if err != nil {
-		return 0
+/* =============== 并发探测函数 =============== */
+func probeICMPConcurrent(ctx context.Context, host string) float64 {
+	results := make(chan time.Duration, icmpCount)
+	var wg sync.WaitGroup
+	wg.Add(icmpCount)
+
+	for i := 0; i < icmpCount; i++ {
+		go func() {
+			defer wg.Done()
+
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			p, err := probing.NewPinger(host)
+			if err != nil {
+				return
+			}
+			p.Count = 1
+			p.Timeout = probeTimeout
+
+			p.SetPrivileged(true)
+			if err = p.Run(); err != nil {
+				p.SetPrivileged(false)
+				if err = p.Run(); err != nil {
+					return
+				}
+			}
+			stats := p.Statistics()
+			if stats.PacketsRecv > 0 {
+				select {
+				case results <- stats.AvgRtt:
+				case <-ctx.Done():
+				}
+			}
+		}()
 	}
-	p.Count = pingCount
-	p.Timeout = timeout
-	p.SetPrivileged(true)
-	if err = p.Run(); err != nil {
-		p.SetPrivileged(false)
-		if err = p.Run(); err != nil {
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var total time.Duration
+	var n int
+	for {
+		select {
+		case <-ctx.Done():
 			return 0
+		case rtt, ok := <-results:
+			if !ok {
+				if n == 0 {
+					return 0
+				}
+				return float64(total/time.Duration(n)) / 1e6
+			}
+			if rtt > 0 {
+				total += rtt
+				n++
+			}
 		}
 	}
-	s := p.Statistics()
-	if s.PacketsRecv > 0 {
-		return float64(s.AvgRtt.Microseconds()) / 1000
-	}
-	return 0
 }
 
-func probeTCP(host string, port int) float64 {
-	start := time.Now()
-	conn, err := dialer.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
-	if err != nil {
-		return 0
-	}
-	_ = conn.Close()
-	return float64(time.Since(start).Microseconds()) / 1000
+func probeTCPConcurrent(ctx context.Context, host string, port int) float64 {
+    results := make(chan time.Duration, tcpCount)
+    addr := fmt.Sprintf("%s:%d", host, port)
+    var wg sync.WaitGroup
+
+    for i := 0; i < tcpCount; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            select {
+            case <-ctx.Done():
+                return
+            default:
+            }
+            start := time.Now()
+            conn, err := net.DialTimeout("tcp", addr, probeTimeout)
+            if err == nil {
+                rtt := time.Since(start)
+                conn.Close()
+                select {
+                case results <- rtt:
+                case <-ctx.Done():
+                }
+            }
+        }()
+    }
+
+    go func() {
+        wg.Wait()
+        close(results)
+    }()
+
+    var validRTTs []time.Duration
+    for {
+        select {
+        case <-ctx.Done():
+            return 0
+        case rtt, ok := <-results:
+            if !ok {
+                if len(validRTTs) == 0 {
+                    return 0
+                }
+                var total time.Duration
+                for _, v := range validRTTs {
+                    total += v
+                }
+                return float64(total/time.Duration(len(validRTTs))) / 1e6
+            }
+            if rtt > 0 {
+                validRTTs = append(validRTTs, rtt)
+            }
+        }
+    }
 }
 
-/* =============== 白名单 =============== */
+/* =============== DNS 缓存 =============== */
+func resolveWithCache(target string) (string, error) {
+	// 检查是否已是 IP
+	if ip := net.ParseIP(target); ip != nil {
+		return ip.String(), nil
+	}
+
+	// 检查缓存
+	if entry, ok := dnsCache.Load(target); ok {
+		if e := entry.(dnsEntry); time.Now().Before(e.Expiry) {
+			if e.Resolved {
+				return e.IP, nil
+			}
+			return "", fmt.Errorf("DNS Resolution Failed")
+		}
+	}
+
+	// 快速 DNS 解析
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, target)
+	if err != nil || len(ips) == 0 {
+		// 缓存失败结果
+		dnsCache.Store(target, dnsEntry{
+			IP:       "",
+			Expiry:   time.Now().Add(30 * time.Second),
+			Resolved: false,
+		})
+		return "", err
+	}
+
+	// 优先选择 IPv4
+	var selectedIP string
+	for _, ip := range ips {
+		if ip.IP.To4() != nil {
+			selectedIP = ip.IP.String()
+			break
+		}
+	}
+	if selectedIP == "" {
+		selectedIP = ips[0].IP.String()
+	}
+
+	// 缓存成功结果
+	dnsCache.Store(target, dnsEntry{
+		IP:       selectedIP,
+		Expiry:   time.Now().Add(dnsCacheTTL),
+		Resolved: true,
+	})
+
+	return selectedIP, nil
+}
+
+/* =============== 权限检查 =============== */
 func ipAllowed(ipStr string) bool {
 	if allowAll {
 		return true
 	}
+
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return false
 	}
+	ipS := ip.String()
 
-	mu.RLock()
-	if _, ok := soloIPs[ip.String()]; ok {
-		mu.RUnlock()
+	// 单 IP 检查 (sync.Map)
+	if _, ok := soloIPs.Load(ipS); ok {
 		return true
 	}
-	for _, nw := range ipNetworks {
-		if nw.Contains(ip) {
-			mu.RUnlock()
-			return true
-		}
-	}
-	needRefresh := false
-	for _, c := range domainCaches {
-		if time.Since(c.LastUpdate) > domainTTL {
-			needRefresh = true
-			break
-		}
-	}
-	mu.RUnlock()
 
-	if needRefresh {
-		refreshDomains()
-		mu.RLock()
-		if _, ok := soloIPs[ip.String()]; ok {
-			mu.RUnlock()
+	// 网络段检查
+	for _, network := range ipNetworks {
+		if network.Contains(ip) {
 			return true
 		}
-		for _, nw := range ipNetworks {
-			if nw.Contains(ip) {
-				mu.RUnlock()
-				return true
+	}
+
+	// 域名缓存检查
+	found := false
+	domainCaches.Range(func(_, value interface{}) bool {
+		cache := value.(*domainCache)
+		for _, cachedIP := range cache.IPs {
+			if cachedIP == ipS {
+				found = true
+				return false
 			}
 		}
-		mu.RUnlock()
-	}
-	return false
+		return true
+	})
+
+	return found
 }
 
-func refreshDomains() {
-	mu.Lock()
-	defer mu.Unlock()
-	for d, c := range domainCaches {
-		if time.Since(c.LastUpdate) <= domainTTL {
-			continue
+/* =============== 后台任务 =============== */
+func domainRefreshWorker(ctx context.Context) {
+	ticker := time.NewTicker(domainTTL)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			domainCaches.Range(func(key, value interface{}) bool {
+				domain := key.(string)
+				cache := value.(*domainCache)
+				
+				if time.Since(cache.LastUpdate) > domainTTL {
+					go refreshDomainIP(domain)
+				}
+				return true
+			})
 		}
-		ips, err := net.LookupIP(d)
-		if err != nil || len(ips) == 0 {
-			continue
-		}
-		for _, old := range c.IPs {
-			delete(soloIPs, old.String())
-		}
-		for _, ip := range ips {
-			soloIPs[ip.String()] = struct{}{}
-		}
-		domainCaches[d] = &domainCache{IPs: ips, LastUpdate: time.Now()}
-		log.Printf("[WhiteList] %s refreshed: %v", d, ips)
 	}
 }
 
-/* =============== 初始化 =============== */
+func refreshDomainIP(domain string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, domain)
+	if err != nil || len(ips) == 0 {
+		domainCaches.Delete(domain)
+		return
+	}
+
+	ipStrings := make([]string, 0, len(ips))
+	for _, ipa := range ips {
+		ipStr := ipa.IP.String()
+		ipStrings = append(ipStrings, ipStr)
+		soloIPs.Store(ipStr, struct{}{})
+	}
+
+	domainCaches.Store(domain, &domainCache{
+		IPs:        ipStrings,
+		LastUpdate: time.Now(),
+	})
+}
+
+
+func dnsCacheCleanup(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			dnsCache.Range(func(key, value interface{}) bool {
+				if entry := value.(dnsEntry); now.After(entry.Expiry) {
+					dnsCache.Delete(key)
+				}
+				return true
+			})
+		}
+	}
+}
+
+/* =============== 初始化函数 =============== */
 func loadConfig(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		log.Fatalf("read config: %v", err)
+		log.Fatalf("读取配置失败: %v", err)
 	}
+	
 	if err := json.Unmarshal(data, &conf); err != nil {
-		log.Fatalf("parse config: %v", err)
+		log.Fatalf("解析配置失败: %v", err)
 	}
+	
 	if conf.HttpListen == "" {
 		conf.HttpListen = ":8080"
 	}
@@ -275,55 +529,63 @@ func buildWhiteList() {
 		return
 	}
 
-	soloIPs = make(map[string]struct{})
-	for _, v := range conf.Auth.AllowIPs {
-		if strings.Contains(v, "/") {
-			if _, nw, err := net.ParseCIDR(v); err == nil {
-				ipNetworks = append(ipNetworks, nw)
+	// 处理 IP 白名单
+	for _, ipStr := range conf.Auth.AllowIPs {
+		ipStr = strings.TrimSpace(ipStr)
+		if ipStr == "" {
+			continue
+		}
+
+		if strings.Contains(ipStr, "/") {
+			if _, network, err := net.ParseCIDR(ipStr); err == nil {
+				ipNetworks = append(ipNetworks, network)
 			}
 		} else {
-			soloIPs[v] = struct{}{}
+			if net.ParseIP(ipStr) != nil {
+				soloIPs.Store(ipStr, struct{}{})
+			}
 		}
 	}
-	for _, d := range conf.Auth.AllowDomains {
-		ips, _ := net.LookupIP(d)
-		domainCaches[d] = &domainCache{IPs: ips, LastUpdate: time.Now()}
-		for _, ip := range ips {
-			soloIPs[ip.String()] = struct{}{}
+
+	// 处理域名白名单：同步解析一次，避免并发写导致 race
+	for _, domain := range conf.Auth.AllowDomains {
+		domain = strings.TrimSpace(domain)
+		if domain == "" {
+			continue
 		}
+		refreshDomainIP(domain)
 	}
 }
 
 /* =============== 工具函数 =============== */
-func resolveTarget(t string) (string, error) {
-	if net.ParseIP(t) != nil {
-		return t, nil
+func extractClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if idx := strings.Index(xff, ","); idx > 0 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
 	}
-	ips, err := net.LookupIP(t)
-	if err != nil || len(ips) == 0 {
-		return "", err
+	
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return xri
 	}
-	return ips[0].String(), nil
+	
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
 }
 
-func realIP(r *http.Request) string {
-	if v := r.Header.Get("X-Forwarded-For"); v != "" {
-		return strings.TrimSpace(strings.Split(v, ",")[0])
+func extractBearerToken(authHeader string) string {
+	const prefix = "Bearer "
+	if strings.HasPrefix(authHeader, prefix) {
+		return authHeader[len(prefix):]
 	}
-	if v := r.Header.Get("X-Real-Ip"); v != "" {
-		return v
-	}
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	return host
-}
-
-/* =============== JSON Error Helper =============== */
-type jsonErr struct {
-	Error string `json:"error"`
+	return ""
 }
 
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(jsonErr{Error: msg})
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
