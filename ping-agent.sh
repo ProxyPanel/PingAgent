@@ -135,7 +135,7 @@ cmd_install() {
   cd "$WORKDIR"
   
   # 下载并验证
-  if ! curl -fL# -o "$ASSET" "$DL_URL"; then
+  if ! curl -fL -o "$ASSET" "$DL_URL"; then
     echo "❌ 下载失败，请检查网络连接和版本号"
     exit 1
   fi
@@ -315,7 +315,7 @@ cmd_update() {
   fi
 
   # 下载并验证
-  if ! curl -fL# -o "$ASSET" "$DL_URL"; then
+  if ! curl -fL -o "$ASSET" "$DL_URL"; then
     echo "❌ 下载失败"
     # 如果停止了服务，尝试重启
     if systemctl list-unit-files | grep -q ping-agent.service; then

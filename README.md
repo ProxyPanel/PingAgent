@@ -1,5 +1,6 @@
 # PingAgent
-轻量级网络连通性探测器 / 多节点主动监控组件 
+轻量级网络连通性探测器 / 多节点主动监控组件
+
 Lightweight Network Probe for Multi-Node Active Monitoring
 
 ---
@@ -28,7 +29,6 @@ bash -s -- install \
   --allow-ips "127.0.0.1,10.0.0.0/8" \
   --allow-domains "control.example.com" \
   --version latest
-
 ```
 
 
@@ -115,7 +115,7 @@ sudo setcap cap_net_raw+ep ./ping-agent # (Linux) 给予 ICMP 权限
 ```bash
 ./ping-agent config.json
 # 输出:
-# PingAgent HTTP 监听 :8080
+# PingAgent Start! Listen :8080
 ```
 
 Systemd 示例
@@ -137,43 +137,60 @@ WantedBy=multi-user.target
 
 ## 8. 调用示例
 
-curl
+### curl
 
 ```bash
-curl -X POST http://AGENT_IP:8080/probe \
+curl -X POST http://127.0.0.1:8080/probe \
      -H "Authorization: Bearer ChangeMeIfNeeded" \
      -H "Content-Type: application/json" \
-     -d '{"target":"8.8.8.8","port":53}'
+     -d '{"target":"bing.com","port":443}'
 ```
 
-返回
-
-```json
-{
-  "icmp_ok": true,
-  "icmp_rtt": 11.4,
-  "tcp_ok": true,
-  "tcp_rtt": 2.9
-}
-```
-
-Laravel
+### Laravel
 
 ```php
 $data = Http::withHeaders([
             'Authorization' => 'Bearer ChangeMeIfNeeded',
-        ])->post('http://probe-cn.example.com:8080/probe', [
-            'target' => '1.1.1.1',
+        ])->post('http://127.0.0.1:8080/probe', [
+            'target' => 'bing.com',
             'port'   => 443,
         ])->json();
 ```
 
-Postman
+### Postman
 
 1. Method: POST
-2. URL: `http://localhost:8080/probe`
+2. URL: `http://127.0.0.1:8080/probe`
 3. Header: `Authorization: Bearer ChangeMeIfNeeded`
-4. Body (raw-JSON): `{"target":"8.8.8.8","port":53}`
+4. Body (raw-JSON): `{"target":"bing.com","port":443}`
+
+
+### 返回
+
+```json
+[
+    {
+        "ip": "2620:1ec:33::10",
+        "icmp": 0,
+        "tcp": 0
+    },
+    {
+        "ip": "2620:1ec:33:1::10",
+        "icmp": 0,
+        "tcp": 0
+    },
+    {
+        "ip": "150.171.28.10",
+        "icmp": 50.2911,
+        "tcp": 64.6117
+    },
+    {
+        "ip": "150.171.27.10",
+        "icmp": 58.1929,
+        "tcp": 40.829933
+    }
+]
+```
 
 
 ## 9. 懒刷新白名单工作流

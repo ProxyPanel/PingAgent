@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,10 +17,8 @@ import (
 	probing "github.com/prometheus-community/pro-bing"
 )
 
-// 版本信息，由构建时注入
 var Version = "dev"
 
-/* ------------ 配置 ------------ */
 type Config struct {
 	HttpListen string `json:"http_listen"`
 	Auth       struct {
@@ -31,561 +28,376 @@ type Config struct {
 	} `json:"auth"`
 }
 
-/* ---------- 白名单缓存 ---------- */
-type domainCache struct {
-	IPs        []string
-	LastUpdate time.Time
-}
-
-/* ------------ 全局变量 ------------ */
-var (
-	conf         Config
-	ipNetworks   []*net.IPNet
-	soloIPs      sync.Map 
-	domainCaches = sync.Map{}
-	allowAll     bool
-	dnsCache     = sync.Map{}
-)
-
-/* ------------ 常量 ------------ */
-const (
-	// 探测参数 - 关键优化点
-	icmpCount   = 3                       // ICMP ping 次数
-	tcpCount    = 3                       // TCP 连接次数
-	probeTimeout = 1500 * time.Millisecond // 单次探测超时
-	totalTimeout = 5 * time.Second         // 总超时时间
-	
-	// 缓存和后台任务
-	dnsCacheTTL = 2 * time.Minute
-	domainTTL   = 5 * time.Minute
-	
-	// 并发控制
-	maxConcurrentProbes = 50 // 降低并发数，避免资源竞争
-)
-
-/* ---------- DNS 缓存结构 ---------- */
-type dnsEntry struct {
-	IP       string
-	Expiry   time.Time
-	Resolved bool
-}
-
-/* =============== 主函数 =============== */
-func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
-		fmt.Printf("ping-agent %s\n", Version)
-		return
-	}
-
-	if len(os.Args) < 2 {
-		log.Fatal("Usage: ./ping-agent <config.json> Or ./ping-agent --version")
-	}
-
-	runtime.GOMAXPROCS(runtime.NumCPU())
-	
-	loadConfig(os.Args[1])
-	buildWhiteList()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	
-	go domainRefreshWorker(ctx)
-	go dnsCacheCleanup(ctx)
-
-	probeSemaphore := make(chan struct{}, maxConcurrentProbes)
-	
-	mux := http.NewServeMux()
-	mux.HandleFunc("/probe", func(w http.ResponseWriter, r *http.Request) {
-		probeHandler(w, r, probeSemaphore)
-	})
-
-	srv := &http.Server{
-		Addr:              conf.HttpListen,
-		Handler:           mux,
-		ReadTimeout:       3 * time.Second,
-		WriteTimeout:      5 * time.Second,
-		IdleTimeout:       30 * time.Second,
-		ReadHeaderTimeout: 1 * time.Second,
-		MaxHeaderBytes:    8192,
-	}
-
-	go func() {
-		log.Printf("PingAgent Start! Listen %s", conf.HttpListen)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP Service failed: %v", err)
-		}
-	}()
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	
-	log.Println("Closing Service...")
-	
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Close failed: %v", err)
-	}
-}
-
-/* =============== HTTP 处理器 =============== */
-type httpReq struct {
-	Target string `json:"target"`
-	Port   int    `json:"port,omitempty"`
-}
-
-type httpResp struct {
+type ProbeResult struct {
 	IP   string  `json:"ip"`
 	ICMP float64 `json:"icmp"`
 	TCP  float64 `json:"tcp"`
 }
 
-func probeHandler(w http.ResponseWriter, r *http.Request, semaphore chan struct{}) {
-	if r.Method != http.MethodPost {
-		writeJSONError(w, http.StatusMethodNotAllowed, "Only Support POST Method")
-		return
-	}
+var (
+	cfg          Config
+	cache        sync.Map // 统一缓存: key -> (value, expiry)
+	ipNetworks   []*net.IPNet
+	allowAll     bool
+	probeLimiter chan struct{}
+	tcpDialer    = &net.Dialer{Timeout: 1500 * time.Millisecond}
+)
 
-	if !ipAllowed(extractClientIP(r)) {
-		writeJSONError(w, http.StatusForbidden, "IP Not Allowed")
+func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "-v" || os.Args[1] == "--version") {
+		fmt.Printf("ping-agent %s\n", Version)
 		return
 	}
-	if conf.Auth.Token != "" && extractBearerToken(r.Header.Get("Authorization")) != conf.Auth.Token {
-		writeJSONError(w, http.StatusUnauthorized, "Authorization Token Invalid")
-		return
+	if len(os.Args) < 2 {
+		log.Fatal("Usage: ./ping-agent <config.json>")
 	}
+	// 初始化
+	loadConfig(os.Args[1])
+	initWhitelist()
+	probeLimiter = make(chan struct{}, 50)
+	// 缓存清理
+	go func() {
+		for range time.Tick(5 * time.Minute) {
+			cache.Range(func(k, v interface{}) bool {
+				if time.Now().After(v.(*cacheItem).expiry) {
+					cache.Delete(k)
+				}
+				return true
+			})
+		}
+	}()
+	// HTTP服务
+	http.HandleFunc("/probe", handleProbe)
+	srv := &http.Server{Addr: cfg.HttpListen, ReadTimeout: 5 * time.Second, WriteTimeout: 10 * time.Second}
+	go func() {
+		log.Printf("PingAgent Start! Listen %s", cfg.HttpListen)
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+	// 优雅关闭
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+}
 
-	// 并发控制
+func loadConfig(path string) {
+	data, _ := os.ReadFile(path)
+	json.Unmarshal(data, &cfg)
+	if cfg.HttpListen == "" {
+		cfg.HttpListen = ":8080"
+	}
+}
+
+func initWhitelist() {
+	if len(cfg.Auth.AllowIPs) == 0 && len(cfg.Auth.AllowDomains) == 0 {
+		allowAll = true
+		return
+	}
+	// 预编译静态IP为map以加速查找
+	ips := make(map[string]bool)
+	for _, ip := range cfg.Auth.AllowIPs {
+		ip = strings.TrimSpace(ip)
+		if strings.Contains(ip, "/") {
+			if _, n, err := net.ParseCIDR(ip); err == nil {
+				ipNetworks = append(ipNetworks, n)
+			}
+		} else if net.ParseIP(ip) != nil {
+			ips[ip] = true
+		}
+	}
+	if len(ips) > 0 {
+		cache.Store("_static_ips", &cacheItem{value: ips, expiry: time.Now().Add(100 * 365 * 24 * time.Hour)})
+	}
+}
+
+func handleProbe(w http.ResponseWriter, r *http.Request) {
+	// 基础检查
+	if r.Method != "POST" {
+		http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	// IP权限
+	if !isAllowed(getClientIP(r)) {
+		http.Error(w, `{"error":"Forbidden"}`, http.StatusForbidden)
+		return
+	}
+	// Token验证
+	if cfg.Auth.Token != "" && r.Header.Get("Authorization") != "Bearer "+cfg.Auth.Token {
+		http.Error(w, `{"error":"Unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	// 限流
 	select {
-	case semaphore <- struct{}{}:
-		defer func() { <-semaphore }()
+	case probeLimiter <- struct{}{}:
+		defer func() { <-probeLimiter }()
 	default:
-		writeJSONError(w, http.StatusTooManyRequests, "Too Many Requests")
+		http.Error(w, `{"error":"Too many requests"}`, http.StatusTooManyRequests)
 		return
 	}
-
-	var req httpReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "Invalid JSON")
+	// 解析请求
+	var req struct {
+		Target string `json:"target"`
+		Port   int    `json:"port"`
+	}
+	if json.NewDecoder(r.Body).Decode(&req) != nil || req.Target == "" {
+		http.Error(w, `{"error":"Bad request"}`, http.StatusBadRequest)
 		return
 	}
-
-	if req.Target == "" {
-		writeJSONError(w, http.StatusBadRequest, "Missing Target Parameter")
-		return
-	}
-
 	if req.Port <= 0 {
 		req.Port = 22
 	} else if req.Port > 65535 {
-		writeJSONError(w, http.StatusBadRequest, "Invalid Port")
+		http.Error(w, `{"error":"Invalid Port"}`, http.StatusBadRequest)
 		return
 	}
-
-	// DNS 解析
-	ip, err := resolveWithCache(req.Target)
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, "DNS Resolve Failed")
-		return
-	}
-
-	// 使用 context 控制整体探测超时
-	ctxProbe, cancel := context.WithTimeout(r.Context(), totalTimeout)
+	// 执行探测
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var icmpRTT, tcpRTT float64
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if v := probeICMPConcurrent(ctxProbe, ip); v > 0 {
-			mu.Lock()
-			icmpRTT = v
-			mu.Unlock()
-		}
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if v := probeTCPConcurrent(ctxProbe, ip, req.Port); v > 0 {
-			mu.Lock()
-			tcpRTT = v
-			mu.Unlock()
-		}
-	}()
-
-	wg.Wait()
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(httpResp{IP: ip, ICMP: icmpRTT, TCP: tcpRTT})
+	json.NewEncoder(w).Encode(probe(ctx, req.Target, req.Port))
 }
 
-/* =============== 并发探测函数 =============== */
-func probeICMPConcurrent(ctx context.Context, host string) float64 {
-	results := make(chan time.Duration, icmpCount)
-	var wg sync.WaitGroup
-	wg.Add(icmpCount)
+func isAllowed(ip string) bool {
+	if allowAll {
+		return true
+	}
+	// 检查静态IP
+	if v, ok := getCache("_static_ips"); ok {
+		if v.(map[string]bool)[ip] {
+			return true
+		}
+	}
+	// 检查CIDR
+	if parsed := net.ParseIP(ip); parsed != nil {
+		for _, n := range ipNetworks {
+			if n.Contains(parsed) {
+				setCache("_ip:"+ip, true, 1*time.Hour) // 缓存匹配结果
+				return true
+			}
+		}
+	}
+	// 检查域名（带缓存）
+	for _, domain := range cfg.Auth.AllowDomains {
+		domain = strings.TrimSpace(domain)
+		if domain == "" {
+			continue
+		}
 
-	for i := 0; i < icmpCount; i++ {
-		go func() {
-			defer wg.Done()
-
-			select {
-			case <-ctx.Done():
-				return
-			default:
+		// 第一次尝试：从缓存获取
+		cacheKey := "_domain:" + domain
+		if v, ok := getCache(cacheKey); ok {
+			ips := v.(map[string]bool)
+			if ips[ip] {
+				return true
 			}
 
-			p, err := probing.NewPinger(host)
+			// IP不在缓存中，且超过5分钟，触发更新
+			if _, recent := getCache(cacheKey + ":checked"); !recent {
+				// 标记已检查，避免5分钟内重复
+				setCache(cacheKey+":checked", true, 5*time.Minute)
+
+				// 异步更新缓存
+				go func(d string) {
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					defer cancel()
+
+					addrs, _ := net.DefaultResolver.LookupIPAddr(ctx, d)
+					if len(addrs) > 0 {
+						m := make(map[string]bool)
+						for _, addr := range addrs {
+							m[addr.IP.String()] = true
+						}
+						setCache("_domain:"+d, m, 24*time.Hour)
+					}
+				}(domain)
+			}
+		} else {
+			// 缓存不存在，同步获取一次
+			ips, _ := getOrResolve(cacheKey, func() (interface{}, error) {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				addrs, err := net.DefaultResolver.LookupIPAddr(ctx, domain)
+				if err != nil {
+					return map[string]bool{}, err
+				}
+				m := make(map[string]bool)
+				for _, addr := range addrs {
+					m[addr.IP.String()] = true
+				}
+				return m, nil
+			}, 24*time.Hour)
+
+			if ips.(map[string]bool)[ip] {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func probe(ctx context.Context, target string, port int) []ProbeResult {
+	// 解析目标
+	ips := []string{}
+	if ip := net.ParseIP(target); ip != nil {
+		ips = []string{target}
+	} else {
+		// DNS解析（带缓存）
+		if v, _ := getOrResolve("_dns:"+target, func() (interface{}, error) {
+			addrs, err := net.DefaultResolver.LookupIPAddr(ctx, target)
 			if err != nil {
-				return
+				return []string{}, err
 			}
-			p.Count = 1
-			p.Timeout = probeTimeout
-
-			p.SetPrivileged(true)
-			if err = p.Run(); err != nil {
-				p.SetPrivileged(false)
-				if err = p.Run(); err != nil {
-					return
+			result := make([]string, 0, len(addrs))
+			for _, addr := range addrs {
+				result = append(result, addr.IP.String())
+				if len(result) >= 10 { // 限制最大IP数
+					break
 				}
 			}
-			stats := p.Statistics()
-			if stats.PacketsRecv > 0 {
+			return result, nil
+		}, 5*time.Minute); v != nil {
+			ips = v.([]string)
+		}
+	}
+	if len(ips) == 0 {
+		return nil
+	}
+	// 并发探测所有IP
+	results := make([]ProbeResult, len(ips))
+	var wg sync.WaitGroup
+	for i, ip := range ips {
+		wg.Add(1)
+		go func(idx int, ip string) {
+			defer wg.Done()
+			ch := make(chan float64, 2)
+			go func() { ch <- probeICMP(ctx, ip) }()
+			go func() { ch <- probeTCP(ctx, ip, port) }()
+			results[idx] = ProbeResult{
+				IP:   ip,
+				ICMP: <-ch,
+				TCP:  <-ch,
+			}
+		}(i, ip)
+	}
+	wg.Wait()
+	return results
+}
+
+// 通用并发探测函数
+func probeN(ctx context.Context, n int, probeFn func() (time.Duration, bool)) float64 {
+	ch := make(chan time.Duration, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if d, ok := probeFn(); ok {
 				select {
-				case results <- stats.AvgRtt:
+				case ch <- d:
 				case <-ctx.Done():
 				}
 			}
 		}()
 	}
-
 	go func() {
 		wg.Wait()
-		close(results)
+		close(ch)
 	}()
-
+	// 收集结果
 	var total time.Duration
-	var n int
-	for {
-		select {
-		case <-ctx.Done():
-			return 0
-		case rtt, ok := <-results:
-			if !ok {
-				if n == 0 {
-					return 0
-				}
-				return float64(total/time.Duration(n)) / 1e6
-			}
-			if rtt > 0 {
-				total += rtt
-				n++
-			}
-		}
+	var count int
+	for d := range ch {
+		total += d
+		count++
 	}
+	if count == 0 {
+		return 0
+	}
+	return float64(total/time.Duration(count)) / 1e6
 }
 
-func probeTCPConcurrent(ctx context.Context, host string, port int) float64 {
-    results := make(chan time.Duration, tcpCount)
-    addr := fmt.Sprintf("%s:%d", host, port)
-    var wg sync.WaitGroup
-
-    for i := 0; i < tcpCount; i++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            select {
-            case <-ctx.Done():
-                return
-            default:
-            }
-            start := time.Now()
-            conn, err := net.DialTimeout("tcp", addr, probeTimeout)
-            if err == nil {
-                rtt := time.Since(start)
-                conn.Close()
-                select {
-                case results <- rtt:
-                case <-ctx.Done():
-                }
-            }
-        }()
-    }
-
-    go func() {
-        wg.Wait()
-        close(results)
-    }()
-
-    var validRTTs []time.Duration
-    for {
-        select {
-        case <-ctx.Done():
-            return 0
-        case rtt, ok := <-results:
-            if !ok {
-                if len(validRTTs) == 0 {
-                    return 0
-                }
-                var total time.Duration
-                for _, v := range validRTTs {
-                    total += v
-                }
-                return float64(total/time.Duration(len(validRTTs))) / 1e6
-            }
-            if rtt > 0 {
-                validRTTs = append(validRTTs, rtt)
-            }
-        }
-    }
-}
-
-/* =============== DNS 缓存 =============== */
-func resolveWithCache(target string) (string, error) {
-	// 检查是否已是 IP
-	if ip := net.ParseIP(target); ip != nil {
-		return ip.String(), nil
-	}
-
-	// 检查缓存
-	if entry, ok := dnsCache.Load(target); ok {
-		if e := entry.(dnsEntry); time.Now().Before(e.Expiry) {
-			if e.Resolved {
-				return e.IP, nil
-			}
-			return "", fmt.Errorf("DNS Resolution Failed")
+func probeICMP(ctx context.Context, host string) float64 {
+	return probeN(ctx, 3, func() (time.Duration, bool) {
+		pinger, err := probing.NewPinger(host)
+		if err != nil {
+			return 0, false
 		}
-	}
-
-	// 快速 DNS 解析
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, target)
-	if err != nil || len(ips) == 0 {
-		// 缓存失败结果
-		dnsCache.Store(target, dnsEntry{
-			IP:       "",
-			Expiry:   time.Now().Add(30 * time.Second),
-			Resolved: false,
-		})
-		return "", err
-	}
-
-	// 优先选择 IPv4
-	var selectedIP string
-	for _, ip := range ips {
-		if ip.IP.To4() != nil {
-			selectedIP = ip.IP.String()
-			break
-		}
-	}
-	if selectedIP == "" {
-		selectedIP = ips[0].IP.String()
-	}
-
-	// 缓存成功结果
-	dnsCache.Store(target, dnsEntry{
-		IP:       selectedIP,
-		Expiry:   time.Now().Add(dnsCacheTTL),
-		Resolved: true,
-	})
-
-	return selectedIP, nil
-}
-
-/* =============== 权限检查 =============== */
-func ipAllowed(ipStr string) bool {
-	if allowAll {
-		return true
-	}
-
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-	ipS := ip.String()
-
-	// 单 IP 检查 (sync.Map)
-	if _, ok := soloIPs.Load(ipS); ok {
-		return true
-	}
-
-	// 网络段检查
-	for _, network := range ipNetworks {
-		if network.Contains(ip) {
-			return true
-		}
-	}
-
-	// 域名缓存检查
-	found := false
-	domainCaches.Range(func(_, value interface{}) bool {
-		cache := value.(*domainCache)
-		for _, cachedIP := range cache.IPs {
-			if cachedIP == ipS {
-				found = true
-				return false
+		pinger.Count = 1
+		pinger.Timeout = 1500 * time.Millisecond
+		pinger.SetPrivileged(true)
+		if err := pinger.Run(); err != nil {
+			pinger.SetPrivileged(false)
+			if err := pinger.Run(); err != nil {
+				return 0, false
 			}
 		}
-		return true
-	})
-
-	return found
-}
-
-/* =============== 后台任务 =============== */
-func domainRefreshWorker(ctx context.Context) {
-	ticker := time.NewTicker(domainTTL)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			domainCaches.Range(func(key, value interface{}) bool {
-				domain := key.(string)
-				cache := value.(*domainCache)
-				
-				if time.Since(cache.LastUpdate) > domainTTL {
-					go refreshDomainIP(domain)
-				}
-				return true
-			})
+		if s := pinger.Statistics(); s.PacketsRecv > 0 {
+			return s.AvgRtt, true
 		}
-	}
-}
-
-func refreshDomainIP(domain string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, domain)
-	if err != nil || len(ips) == 0 {
-		domainCaches.Delete(domain)
-		return
-	}
-
-	ipStrings := make([]string, 0, len(ips))
-	for _, ipa := range ips {
-		ipStr := ipa.IP.String()
-		ipStrings = append(ipStrings, ipStr)
-		soloIPs.Store(ipStr, struct{}{})
-	}
-
-	domainCaches.Store(domain, &domainCache{
-		IPs:        ipStrings,
-		LastUpdate: time.Now(),
+		return 0, false
 	})
 }
 
-
-func dnsCacheCleanup(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			now := time.Now()
-			dnsCache.Range(func(key, value interface{}) bool {
-				if entry := value.(dnsEntry); now.After(entry.Expiry) {
-					dnsCache.Delete(key)
-				}
-				return true
-			})
+func probeTCP(ctx context.Context, host string, port int) float64 {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	return probeN(ctx, 3, func() (time.Duration, bool) {
+		start := time.Now()
+		if conn, err := tcpDialer.DialContext(ctx, "tcp", addr); err == nil {
+			conn.Close()
+			return time.Since(start), true
 		}
-	}
+		return 0, false
+	})
 }
 
-/* =============== 初始化函数 =============== */
-func loadConfig(path string) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		log.Fatalf("读取配置失败: %v", err)
-	}
-	
-	if err := json.Unmarshal(data, &conf); err != nil {
-		log.Fatalf("解析配置失败: %v", err)
-	}
-	
-	if conf.HttpListen == "" {
-		conf.HttpListen = ":8080"
-	}
+// ============ 工具函数 ============
+type cacheItem struct {
+	value  interface{}
+	expiry time.Time
 }
 
-func buildWhiteList() {
-	if len(conf.Auth.AllowIPs) == 0 && len(conf.Auth.AllowDomains) == 0 {
-		allowAll = true
-		return
-	}
-
-	// 处理 IP 白名单
-	for _, ipStr := range conf.Auth.AllowIPs {
-		ipStr = strings.TrimSpace(ipStr)
-		if ipStr == "" {
-			continue
+func getCache(key string) (interface{}, bool) {
+	if v, ok := cache.Load(key); ok {
+		if item := v.(*cacheItem); time.Now().Before(item.expiry) {
+			return item.value, true
 		}
-
-		if strings.Contains(ipStr, "/") {
-			if _, network, err := net.ParseCIDR(ipStr); err == nil {
-				ipNetworks = append(ipNetworks, network)
-			}
-		} else {
-			if net.ParseIP(ipStr) != nil {
-				soloIPs.Store(ipStr, struct{}{})
-			}
-		}
+		cache.Delete(key)
 	}
-
-	// 处理域名白名单：同步解析一次，避免并发写导致 race
-	for _, domain := range conf.Auth.AllowDomains {
-		domain = strings.TrimSpace(domain)
-		if domain == "" {
-			continue
-		}
-		refreshDomainIP(domain)
-	}
+	return nil, false
 }
 
-/* =============== 工具函数 =============== */
-func extractClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if idx := strings.Index(xff, ","); idx > 0 {
-			return strings.TrimSpace(xff[:idx])
+func setCache(key string, value interface{}, ttl time.Duration) {
+	cache.Store(key, &cacheItem{value: value, expiry: time.Now().Add(ttl)})
+}
+
+func getOrResolve(key string, resolve func() (interface{}, error), ttl time.Duration) (interface{}, error) {
+	if v, ok := getCache(key); ok {
+		return v, nil
+	}
+	v, err := resolve()
+	if err == nil {
+		setCache(key, v, ttl)
+	}
+	return v, err
+}
+
+func getClientIP(r *http.Request) string {
+	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
+		if i := strings.Index(ip, ","); i > 0 {
+			return strings.TrimSpace(ip[:i])
 		}
-		return strings.TrimSpace(xff)
+		return strings.TrimSpace(ip)
 	}
-	
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
+	if ip := r.Header.Get("X-Real-IP"); ip != "" {
+		return ip
 	}
-	
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return host
 	}
 	return r.RemoteAddr
-}
-
-func extractBearerToken(authHeader string) string {
-	const prefix = "Bearer "
-	if strings.HasPrefix(authHeader, prefix) {
-		return authHeader[len(prefix):]
-	}
-	return ""
-}
-
-func writeJSONError(w http.ResponseWriter, status int, msg string) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
