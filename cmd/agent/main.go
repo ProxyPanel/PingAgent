@@ -38,6 +38,7 @@ var (
 	cfg          Config
 	cache        sync.Map // 统一缓存: key -> (value, expiry)
 	ipNetworks   []*net.IPNet
+	staticIPs    map[string]bool
 	allowAll     bool
 	probeLimiter chan struct{}
 	tcpDialer    = &net.Dialer{Timeout: 1500 * time.Millisecond}
@@ -97,8 +98,8 @@ func initWhitelist() {
 		allowAll = true
 		return
 	}
-	// 预编译静态IP为map以加速查找
-	ips := make(map[string]bool)
+	staticIPs = make(map[string]bool)
+
 	for _, ip := range cfg.Auth.AllowIPs {
 		ip = strings.TrimSpace(ip)
 		if strings.Contains(ip, "/") {
@@ -106,11 +107,8 @@ func initWhitelist() {
 				ipNetworks = append(ipNetworks, n)
 			}
 		} else if net.ParseIP(ip) != nil {
-			ips[ip] = true
+			staticIPs[ip] = true
 		}
-	}
-	if len(ips) > 0 {
-		cache.Store("_static_ips", &cacheItem{value: ips, expiry: time.Now().Add(100 * 365 * 24 * time.Hour)})
 	}
 }
 
@@ -161,21 +159,45 @@ func handleProbe(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(probe(ctx, req.Target, req.Port))
 }
 
+// 解析域名，返回所有IP字符串
+func resolveDomain(domain string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, domain)
+	if err != nil {
+		return nil, err
+	}
+	ips := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		ips = append(ips, addr.IP.String())
+	}
+	return ips, nil
+}
+
+func domainIPsToMap(domain string) (map[string]bool, error) {
+	ips, err := resolveDomain(domain)
+	if err != nil {
+		return map[string]bool{}, err
+	}
+	m := make(map[string]bool)
+	for _, addr := range ips {
+		m[addr] = true
+	}
+	return m, nil
+}
+
 func isAllowed(ip string) bool {
 	if allowAll {
 		return true
 	}
 	// 检查静态IP
-	if v, ok := getCache("_static_ips"); ok {
-		if v.(map[string]bool)[ip] {
-			return true
-		}
+	if staticIPs[ip] {
+		return true
 	}
 	// 检查CIDR
 	if parsed := net.ParseIP(ip); parsed != nil {
 		for _, n := range ipNetworks {
 			if n.Contains(parsed) {
-				setCache("_ip:"+ip, true, 1*time.Hour) // 缓存匹配结果
 				return true
 			}
 		}
@@ -189,51 +211,26 @@ func isAllowed(ip string) bool {
 
 		// 第一次尝试：从缓存获取
 		cacheKey := "_domain:" + domain
-		if v, ok := getCache(cacheKey); ok {
-			ips := v.(map[string]bool)
-			if ips[ip] {
-				return true
-			}
 
-			// IP不在缓存中，且超过5分钟，触发更新
-			if _, recent := getCache(cacheKey + ":checked"); !recent {
-				// 标记已检查，避免5分钟内重复
-				setCache(cacheKey+":checked", true, 5*time.Minute)
+		// 统一使用getOrResolve处理缓存
+		ips, _ := getOrResolve(cacheKey, func() (interface{}, error) {
+			return domainIPsToMap(domain)
+		}, 24*time.Hour)
 
-				// 异步更新缓存
-				go func(d string) {
-					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-					defer cancel()
+		if ips.(map[string]bool)[ip] {
+			return true
+		}
 
-					addrs, _ := net.DefaultResolver.LookupIPAddr(ctx, d)
-					if len(addrs) > 0 {
-						m := make(map[string]bool)
-						for _, addr := range addrs {
-							m[addr.IP.String()] = true
-						}
-						setCache("_domain:"+d, m, 24*time.Hour)
-					}
-				}(domain)
-			}
-		} else {
-			// 缓存不存在，同步获取一次
-			ips, _ := getOrResolve(cacheKey, func() (interface{}, error) {
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				defer cancel()
-				addrs, err := net.DefaultResolver.LookupIPAddr(ctx, domain)
-				if err != nil {
-					return map[string]bool{}, err
+		// IP不在缓存中，且超过5分钟，触发更新
+		if _, recent := getCache(cacheKey + ":checked"); !recent {
+			setCache(cacheKey+":checked", true, 5*time.Minute)
+			// 异步更新缓存
+			go func(d string) {
+				m, err := domainIPsToMap(d)
+				if err == nil && len(m) > 0 {
+					setCache(cacheKey, m, 24*time.Hour)
 				}
-				m := make(map[string]bool)
-				for _, addr := range addrs {
-					m[addr.IP.String()] = true
-				}
-				return m, nil
-			}, 24*time.Hour)
-
-			if ips.(map[string]bool)[ip] {
-				return true
-			}
+			}(domain)
 		}
 	}
 
@@ -248,13 +245,13 @@ func probe(ctx context.Context, target string, port int) []ProbeResult {
 	} else {
 		// DNS解析（带缓存）
 		if v, _ := getOrResolve("_dns:"+target, func() (interface{}, error) {
-			addrs, err := net.DefaultResolver.LookupIPAddr(ctx, target)
+			allIPs, err := resolveDomain(target)
 			if err != nil {
 				return []string{}, err
 			}
-			result := make([]string, 0, len(addrs))
-			for _, addr := range addrs {
-				result = append(result, addr.IP.String())
+			result := make([]string, 0, min(len(allIPs), 10))
+			for _, ip := range allIPs {
+				result = append(result, ip)
 				if len(result) >= 10 { // 限制最大IP数
 					break
 				}

@@ -60,7 +60,7 @@ ping-agent/
 
 ## 3. 运行环境
 
-1. Go 1.22+
+1. Go 1.24+
 2. （Linux）给予二进制 ICMP 权限
    ```
    sudo setcap cap_net_raw+ep ./ping-agent
