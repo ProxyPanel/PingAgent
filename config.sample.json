@@ -1,5 +1,5 @@
 {
-  "http_listen": ":50051",
+  "http_listen": ":8080",
   "auth": {
     "token": "ChangeMeIfNeeded"
   }
