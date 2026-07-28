@@ -16,9 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/net/icmp"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
+	probing "github.com/prometheus-community/pro-bing"
 )
 
 var Version = "dev"
@@ -32,11 +30,6 @@ type Config struct {
 		AllowDomains []string `json:"allow_domains"`
 	} `json:"auth"`
 }
-
-var (
-	globalICMPConn4 *icmp.PacketConn
-	globalICMPConn6 *icmp.PacketConn
-)
 
 // 探测结果
 type ProbeResult struct {
@@ -81,16 +74,6 @@ const (
 	probeSamples        = 3 // 每次探测的采样数
 )
 
-func initGlobalICMP() error {
-	var err error
-	globalICMPConn4, err = icmp.ListenPacket("ip4:icmp", "0.0.0.0")
-	if err != nil {
-		// 尝试非特权 UDP 降级
-		globalICMPConn4, err = icmp.ListenPacket("udp4", "0.0.0.0")
-	}
-	return err
-}
-
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "-v" || os.Args[1] == "--version") {
 		fmt.Printf("ping-agent %s\n", Version)
@@ -112,8 +95,6 @@ func main() {
 	// 启动缓存清理
 	stopCacheCleaner := startCacheCleaner()
 	defer stopCacheCleaner()
-
-	initGlobalICMP()
 
 	// 启动HTTP服务
 	srv := startHTTPServer()
@@ -491,140 +472,28 @@ func domainIPsToMap(domain string) (map[string]bool, error) {
 	return m, nil
 }
 
-// 原生ICMP探测实现
+// 使用 pro-bing 库实现可靠的 ICMP 探测
 func probeICMP(ctx context.Context, host string) float64 {
-	// 解析目标地址
-	dst, err := net.ResolveIPAddr("ip", host)
+	pinger, err := probing.NewPinger(host)
 	if err != nil {
 		return 0
 	}
 
-	// 根据IP版本选择协议
-	var network string
-	var proto int
-	if dst.IP.To4() != nil {
-		network = "ip4:icmp"
-		proto = 1 // ICMP for IPv4
-	} else {
-		network = "ip6:ipv6-icmp"
-		proto = 58 // ICMPv6
-	}
+	pinger.Count = probeSamples             // 保持 3 次采样不变
+	pinger.Interval = 10 * time.Millisecond // 关键：发包间隔缩短到 10ms（第0ms、10ms、20ms连续发完）
+	pinger.Timeout = 600 * time.Millisecond // 关键：丢包/死机时最多只等 600ms，不再死等 1.5s
+	pinger.SetPrivileged(true)
 
-	// 创建ICMP连接
-	conn, err := icmp.ListenPacket(network, "")
-	if err != nil {
-		// 如果需要root权限失败，尝试非特权模式
-		if network == "ip4:icmp" {
-			conn, err = icmp.ListenPacket("udp4", "")
-		} else {
-			conn, err = icmp.ListenPacket("udp6", "")
-		}
-		if err != nil {
-			return 0
-		}
-	}
-	defer conn.Close()
-
-	// 设置读取超时
-	conn.SetDeadline(time.Now().Add(pingTimeout))
-
-	// 收集多次探测结果
-	durations := collectICMPSamples(ctx, conn, dst, proto, probeSamples)
-	if len(durations) == 0 {
+	if err := pinger.RunWithContext(ctx); err != nil {
 		return 0
 	}
 
-	return calculateAverage(durations)
-}
-
-// 收集ICMP采样数据
-func collectICMPSamples(ctx context.Context, conn *icmp.PacketConn, dst *net.IPAddr, proto int, samples int) []time.Duration {
-	var validResults []time.Duration
-
-	for i := 0; i < samples; i++ {
-		select {
-		case <-ctx.Done():
-			return validResults
-		default:
-			// 每次采样单独设置读写超时，防止整体超时影响单次读取
-			conn.SetDeadline(time.Now().Add(pingTimeout))
-
-			duration := sendICMPPacket(conn, dst, proto, i)
-			if duration > 0 {
-				validResults = append(validResults, duration)
-			}
-
-			// 稍微间隔 10ms，避免发包冲突
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-
-	return validResults
-}
-
-// 发送单个ICMP包并等待响应
-func sendICMPPacket(conn *icmp.PacketConn, dst *net.IPAddr, proto int, seq int) time.Duration {
-	// 构造ICMP包
-	var icmpType icmp.Type
-	if dst.IP.To4() != nil {
-		icmpType = ipv4.ICMPTypeEcho
-	} else {
-		icmpType = ipv6.ICMPTypeEchoRequest
-	}
-
-	message := &icmp.Message{
-		Type: icmpType,
-		Code: 0,
-		Body: &icmp.Echo{
-			ID:   os.Getpid() & 0xffff,
-			Seq:  seq,
-			Data: []byte("ping"),
-		},
-	}
-
-	data, err := message.Marshal(nil)
-	if err != nil {
+	stats := pinger.Statistics()
+	if stats.PacketsRecv == 0 {
 		return 0
 	}
 
-	// 发送包
-	start := time.Now()
-	_, err = conn.WriteTo(data, dst)
-	if err != nil {
-		return 0
-	}
-
-	// 接收响应
-	reply := make([]byte, 1500)
-	n, _, err := conn.ReadFrom(reply)
-	if err != nil {
-		return 0
-	}
-	duration := time.Since(start)
-
-	// 验证响应
-	replyMsg, err := icmp.ParseMessage(proto, reply[:n])
-	if err != nil {
-		return 0
-	}
-
-	// 检查响应类型
-	var isEchoReply bool
-	if dst.IP.To4() != nil {
-		isEchoReply = replyMsg.Type == ipv4.ICMPTypeEchoReply
-	} else {
-		isEchoReply = replyMsg.Type == ipv6.ICMPTypeEchoReply
-	}
-
-	if isEchoReply {
-		if echo, ok := replyMsg.Body.(*icmp.Echo); ok {
-			if echo.ID == os.Getpid()&0xffff && echo.Seq == seq {
-				return duration
-			}
-		}
-	}
-
-	return 0
+	return float64(stats.AvgRtt) / float64(time.Millisecond)
 }
 
 // TCP探测
@@ -648,11 +517,14 @@ func collectTCPSamples(ctx context.Context, addr string, samples int) []time.Dur
 
 	resultChan := make(chan result, samples)
 
-	// 并发进行多次TCP连接
 	for i := 0; i < samples; i++ {
 		go func() {
 			start := time.Now()
-			conn, err := tcpDialer.DialContext(ctx, "tcp", addr)
+			// 使用带 500ms 超时的 dialCtx，快速释放不通的连接
+			dialCtx, dialCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+			defer dialCancel()
+
+			conn, err := tcpDialer.DialContext(dialCtx, "tcp", addr)
 			if err == nil {
 				conn.Close()
 				resultChan <- result{time.Since(start), true}
@@ -662,7 +534,6 @@ func collectTCPSamples(ctx context.Context, addr string, samples int) []time.Dur
 		}()
 	}
 
-	// 收集结果
 	var validResults []time.Duration
 	for i := 0; i < samples; i++ {
 		select {
