@@ -33,6 +33,11 @@ type Config struct {
 	} `json:"auth"`
 }
 
+var (
+	globalICMPConn4 *icmp.PacketConn
+	globalICMPConn6 *icmp.PacketConn
+)
+
 // 探测结果
 type ProbeResult struct {
 	IP   string  `json:"ip"`
@@ -76,6 +81,16 @@ const (
 	probeSamples        = 3 // 每次探测的采样数
 )
 
+func initGlobalICMP() error {
+	var err error
+	globalICMPConn4, err = icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	if err != nil {
+		// 尝试非特权 UDP 降级
+		globalICMPConn4, err = icmp.ListenPacket("udp4", "0.0.0.0")
+	}
+	return err
+}
+
 func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "-v" || os.Args[1] == "--version") {
 		fmt.Printf("ping-agent %s\n", Version)
@@ -97,6 +112,8 @@ func main() {
 	// 启动缓存清理
 	stopCacheCleaner := startCacheCleaner()
 	defer stopCacheCleaner()
+
+	initGlobalICMP()
 
 	// 启动HTTP服务
 	srv := startHTTPServer()
@@ -522,31 +539,23 @@ func probeICMP(ctx context.Context, host string) float64 {
 
 // 收集ICMP采样数据
 func collectICMPSamples(ctx context.Context, conn *icmp.PacketConn, dst *net.IPAddr, proto int, samples int) []time.Duration {
-	type result struct {
-		duration time.Duration
-		success  bool
-	}
-
-	resultChan := make(chan result, samples)
-
-	// 并发发送多个ping包
-	for i := 0; i < samples; i++ {
-		go func(seq int) {
-			duration := sendICMPPacket(conn, dst, proto, seq)
-			resultChan <- result{duration, duration > 0}
-		}(i)
-	}
-
-	// 收集结果
 	var validResults []time.Duration
+
 	for i := 0; i < samples; i++ {
 		select {
-		case r := <-resultChan:
-			if r.success {
-				validResults = append(validResults, r.duration)
-			}
 		case <-ctx.Done():
 			return validResults
+		default:
+			// 每次采样单独设置读写超时，防止整体超时影响单次读取
+			conn.SetDeadline(time.Now().Add(pingTimeout))
+
+			duration := sendICMPPacket(conn, dst, proto, i)
+			if duration > 0 {
+				validResults = append(validResults, duration)
+			}
+
+			// 稍微间隔 10ms，避免发包冲突
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 
