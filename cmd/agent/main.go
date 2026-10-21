@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,11 +24,13 @@ var Version = "dev"
 
 // 配置结构
 type Config struct {
-	HttpListen string `json:"http_listen"`
+	HttpListen string   `json:"http_listen"`
+	DNSServers []string `json:"dns_servers"`
 	Auth       struct {
-		Token        string   `json:"token"`
-		AllowIPs     []string `json:"allow_ips"`
-		AllowDomains []string `json:"allow_domains"`
+		Token          string   `json:"token"`
+		AllowIPs       []string `json:"allow_ips"`
+		AllowDomains   []string `json:"allow_domains"`
+		TrustedProxies []string `json:"trusted_proxies"`
 	} `json:"auth"`
 }
 
@@ -46,11 +49,12 @@ type cacheItem struct {
 
 // 白名单管理器
 type WhitelistManager struct {
-	mu           sync.RWMutex
-	ipNetworks   []*net.IPNet
-	staticIPs    map[string]bool
-	allowAll     bool
-	allowDomains []string
+	mu             sync.RWMutex
+	ipNetworks     []*net.IPNet
+	staticIPs      map[string]bool
+	allowAll       bool
+	allowDomains   []string
+	trustedProxies []*net.IPNet
 }
 
 var (
@@ -59,6 +63,8 @@ var (
 	whitelistManager *WhitelistManager
 	probeLimiter     chan struct{}
 	tcpDialer        = &net.Dialer{Timeout: 1500 * time.Millisecond}
+	resolver         = net.DefaultResolver
+	dnsRoundRobin    atomic.Uint64
 )
 
 const (
@@ -91,6 +97,10 @@ func main() {
 
 	whitelistManager = initWhitelist()
 	probeLimiter = make(chan struct{}, maxConcurrentProbes)
+	resolver = newResolver(cfg.DNSServers)
+
+	// 预热域名白名单缓存，请求路径不再做同步 DNS
+	whitelistManager.prewarmDomainCaches()
 
 	// 启动缓存清理
 	stopCacheCleaner := startCacheCleaner()
@@ -124,11 +134,12 @@ func loadConfig(path string) error {
 // 初始化白名单
 func initWhitelist() *WhitelistManager {
 	wm := &WhitelistManager{
-		staticIPs:    make(map[string]bool),
-		allowDomains: cfg.Auth.AllowDomains,
+		staticIPs:      make(map[string]bool),
+		allowDomains:   normalizeDomains(cfg.Auth.AllowDomains),
+		trustedProxies: parseNetworks(cfg.Auth.TrustedProxies, "trusted_proxy"),
 	}
 
-	if len(cfg.Auth.AllowIPs) == 0 && len(cfg.Auth.AllowDomains) == 0 {
+	if len(cfg.Auth.AllowIPs) == 0 && len(wm.allowDomains) == 0 {
 		wm.allowAll = true
 		return wm
 	}
@@ -327,34 +338,46 @@ func (wm *WhitelistManager) isAllowed(ip string) bool {
 	return wm.checkDomainIP(ip)
 }
 
-// 检查IP是否属于允许的域名
+// 检查IP是否属于允许的域名（只读缓存，热路径不做同步解析）
 func (wm *WhitelistManager) checkDomainIP(ip string) bool {
 	for _, domain := range wm.allowDomains {
-		domain = strings.TrimSpace(domain)
-		if domain == "" {
+		cacheKey := "_domain:" + domain
+
+		ips, ok := getCache(cacheKey)
+		if ok && ips != nil {
+			if ipMap, isMap := ips.(map[string]bool); isMap && ipMap[ip] {
+				return true
+			}
 			continue
 		}
 
-		cacheKey := "_domain:" + domain
-		ips, err := getOrResolve(cacheKey, func() (interface{}, error) {
-			return domainIPsToMap(domain)
-		}, domainCacheTTL)
-
-		if err == nil && ips != nil {
-			if ipMap, ok := ips.(map[string]bool); ok && ipMap[ip] {
-				return true
-			}
-		}
-
-		// 触发异步更新
-		updateKey := cacheKey + ":updating"
-		if _, recent := getCache(updateKey); !recent {
-			setCache(updateKey, true, 5*time.Minute)
-			go wm.updateDomainCache(domain, cacheKey)
-		}
+		// 缓存缺失/过期：后台刷新（带冷却），本次请求不放行
+		wm.triggerDomainRefresh(domain, cacheKey)
 	}
 
 	return false
+}
+
+// triggerDomainRefresh 异步刷新域名缓存，5 分钟冷却防惊群
+func (wm *WhitelistManager) triggerDomainRefresh(domain, cacheKey string) {
+	updateKey := cacheKey + ":updating"
+	if _, recent := getCache(updateKey); recent {
+		return
+	}
+	setCache(updateKey, true, 5*time.Minute)
+	go wm.updateDomainCache(domain, cacheKey)
+}
+
+// prewarmDomainCaches 启动时同步预热各允许域名的解析结果
+func (wm *WhitelistManager) prewarmDomainCaches() {
+	for _, domain := range wm.allowDomains {
+		if m, err := domainIPsToMap(domain); err == nil && len(m) > 0 {
+			setCache("_domain:"+domain, m, domainCacheTTL)
+			log.Printf("Prewarmed domain %s: %d IPs", domain, len(m))
+		} else if err != nil {
+			log.Printf("Prewarm domain %s failed: %v", domain, err)
+		}
+	}
 }
 
 // 异步更新域名缓存
@@ -441,7 +464,7 @@ func resolveDomain(domain string) ([]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, domain)
+	addrs, err := resolver.LookupIPAddr(ctx, domain)
 	if err != nil {
 		return nil, err
 	}
@@ -593,27 +616,124 @@ func getOrResolve(key string, resolve func() (interface{}, error), ttl time.Dura
 }
 
 /*============ 工具函数 ============*/
-// 获取客户端IP
+// 获取客户端IP：默认使用连接源地址，仅当来源在 trusted_proxies 内才采信转发头
 func getClientIP(r *http.Request) string {
-	// X-Forwarded-For
+	remote := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(remote); err == nil {
+		remote = host
+	}
+
+	if !whitelistManager.isTrustedProxy(remote) {
+		return remote
+	}
+
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if i := strings.Index(xff, ","); i > 0 {
+		if i := strings.Index(xff, ","); i >= 0 {
 			return strings.TrimSpace(xff[:i])
 		}
 		return strings.TrimSpace(xff)
 	}
-
-	// X-Real-IP
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
 		return strings.TrimSpace(xri)
 	}
 
-	// RemoteAddr
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
+	return remote
+}
+
+// 构建解析器：未配置 dns_servers 时继承系统解析
+func newResolver(servers []string) *net.Resolver {
+	var addrs []string
+	for _, s := range servers {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		host := strings.Trim(s, "[]")
+		port := "53"
+		if h, p, err := net.SplitHostPort(host); err == nil {
+			host, port = h, p
+		}
+		if net.ParseIP(host) == nil {
+			log.Printf("Invalid dns_server: %s", s)
+			continue
+		}
+		addrs = append(addrs, net.JoinHostPort(host, port))
 	}
 
-	return r.RemoteAddr
+	if len(addrs) == 0 {
+		return net.DefaultResolver
+	}
+
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	r := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			// 每个查询轮换一台，失败重试时自然落到下一个
+			a := addrs[dnsRoundRobin.Add(1)%uint64(len(addrs))]
+			return dialer.DialContext(ctx, "udp", a)
+		},
+	}
+	log.Printf("Using custom DNS servers: %v", addrs)
+	return r
+}
+
+// 规范化域名列表：去空白、剔除空项
+func normalizeDomains(in []string) []string {
+	var out []string
+	for _, d := range in {
+		if d = strings.TrimSpace(d); d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// 解析 IP/CIDR 列表为网段，供可信代理匹配使用
+func parseNetworks(entries []string, label string) []*net.IPNet {
+	var nets []*net.IPNet
+	for _, e := range entries {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if !strings.Contains(e, "/") {
+			ip := net.ParseIP(e)
+			if ip == nil {
+				log.Printf("Invalid %s: %s", label, e)
+				continue
+			}
+			if ip.To4() != nil {
+				e += "/32"
+			} else {
+				e += "/128"
+			}
+		}
+		if _, n, err := net.ParseCIDR(e); err == nil {
+			nets = append(nets, n)
+		} else {
+			log.Printf("Invalid %s CIDR: %s", label, e)
+		}
+	}
+	return nets
+}
+
+// isTrustedProxy 判断直连来源是否属于可信代理段
+func (wm *WhitelistManager) isTrustedProxy(ip string) bool {
+	if len(wm.trustedProxies) == 0 {
+		return false
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	wm.mu.RLock()
+	defer wm.mu.RUnlock()
+	for _, n := range wm.trustedProxies {
+		if n.Contains(parsed) {
+			return true
+		}
+	}
+	return false
 }
 
 // 写入JSON错误响应

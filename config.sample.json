@@ -1,6 +1,8 @@
 {
   "http_listen": ":8080",
+  "dns_servers": [],
   "auth": {
-    "token": "ChangeMeIfNeeded"
+    "token": "ChangeMeIfNeeded",
+    "trusted_proxies": []
   }
 }
