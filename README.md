@@ -24,7 +24,7 @@ Lightweight Network Probe for Multi-Node Active Monitoring
 
 环境要求
 
-- Go 1.21+ (推荐 1.24+)
+- Go 1.27+
 - Linux/macOS/Windows
 
 ```bash
@@ -50,14 +50,16 @@ sudo setcap cap_net_raw+ep ./ping-agent
 ### 脚本安装
 
 ```bash
-curl -sSfL https://raw.githubusercontent.com/ProxyPanel/PingAgent/main/ping-agent.sh | \
+curl -sSfL https://cdn.jsdelivr.net/gh/ProxyPanel/PingAgent@main/ping-agent.sh | \
 bash -s -- install \
-  --token 123456 \
+  --token '123456' \
   --listen ":8080" \
   --allow-ips "127.0.0.1,10.0.0.0/8" \
   --allow-domains "control.example.com" \
   --version latest
 ```
+
+> 如果 jsDelivr 取不到，可把 URL 换成 `https://raw.githubusercontent.com/ProxyPanel/PingAgent/main/ping-agent.sh` 回源 GitHub。
 
 #### 更新
 
@@ -82,22 +84,28 @@ bash -s -- install \
 ```json
 {
   "http_listen": ":8080",
+  "dns_servers": ["223.5.5.5", "8.8.8.8"],
   "auth": {
     "token": "ChangeMeIfNeeded",
     "allow_ips": ["192.168.1.0/24", "10.0.0.1", "172.16.0.0/16"],
-    "allow_domains": ["trusted.example.com", "api.partner.com"]
+    "allow_domains": ["trusted.example.com", "api.partner.com"],
+    "trusted_proxies": ["127.0.0.1", "10.0.0.0/8"]
   }
 }
 ```
 
 配置说明
 
-| 字段               | 说明                     | 默认值         |
-| ------------------ | ------------------------ | -------------- |
-| http_listen        | HTTP 监听地址            | :8080          |
-| auth.token         | Bearer Token 认证令牌    | 空（不启用）   |
-| auth.allow_ips     | IP 白名单列表，支持 CIDR | 空（允许所有） |
-| auth.allow_domains | 域名白名单列表           | 空（允许所有） |
+| 字段                | 说明                                                        | 默认值         |
+| ------------------- | ----------------------------------------------------------- | -------------- |
+| http_listen         | HTTP 监听地址                                               | :8080          |
+| dns_servers         | 自定义 DNS（IP 或 IP:port）；留空继承宿主机                 | 空             |
+| auth.token          | Bearer Token 认证令牌                                       | 空（不启用）   |
+| auth.allow_ips      | IP 白名单列表，支持 CIDR                                    | 空（允许所有） |
+| auth.allow_domains  | 域名白名单列表（启动时预热，热路径只读缓存）                | 空（允许所有） |
+| auth.trusted_proxies| 可信代理 IP/CIDR 列表；仅当直连来源在此列表内才采信 XFF     | 空             |
+
+> 安全默认：`X-Forwarded-For` / `X-Real-IP` 只在直连来源属于 `trusted_proxies` 时才用于白名单匹配，防止伪造头绕过 IP 白名单。裸监听公网时无需设置；确在反向代理后面，把代理地址加入 `trusted_proxies`。
 
 ## 使用方法
 
