@@ -28,6 +28,10 @@ archives:
       - LICENSE
       - README.md
 
+upx:
+  - enabled: true
+    goos: [linux]
+
 checksum:
   name_template: "{{ .ProjectName }}_checksums.txt"
 
@@ -44,4 +48,4 @@ release:
   footer: |
     ## 📦 安装说明
 
-    下载对应平台的二进制文件即可使用。所有二进制文件已使用 UPX 压缩以减小体积。
+    下载对应平台的二进制文件即可使用。Linux 二进制已使用 UPX 压缩以减小体积。
